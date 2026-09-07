@@ -411,6 +411,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	defer cancel()
 
 	switch req.Type {
+	case "browse":
+		return p.browse(ctx, req.Data.(browseRequest))
 	case ApiRequestTypeRoot:
 		return &ApiResponseRoot{PlaybackReady: p.playbackReady()}, nil
 	case ApiRequestTypeWebApi:
@@ -599,48 +601,54 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if err != nil || spotID.Type() != librespot.SpotifyIdTypePlaylist {
 			return nil, ErrBadRequest
 		}
-
-		spotCtx, err := p.sess.Spclient().ContextResolve(ctx, data.Uri)
-		if err != nil {
-			return nil, fmt.Errorf("failed resolving context: %w", err)
-		}
-
-		ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, p.sess.Spclient(), spotCtx)
-		if err != nil {
-			return nil, fmt.Errorf("failed creating track list from context: %w", err)
-		}
-
-		allTracks := ctxTracks.AllTracks(ctx)
-		total := len(allTracks)
-		offset := data.Offset
-		if offset > total {
-			offset = total
-		}
-		end := offset + data.Limit
-		if end > total {
-			end = total
-		}
-
-		resolvedTracks := make([]ApiResponseResolvedTrack, 0, end-offset)
-		for _, tr := range allTracks[offset:end] {
-			mapped := mapResolvedTrack(tr)
-			if mapped.Name == "" || len(mapped.Artists) == 0 || mapped.Img == "" {
-				enrichResolvedTrack(ctx, p, &mapped)
-			}
-			resolvedTracks = append(resolvedTracks, mapped)
-		}
-
-		return &ApiResponseResolveTracks{
-			Uri:     data.Uri,
-			Offset:  offset,
-			Limit:   data.Limit,
-			Total:   total,
-			HasNext: end < total,
-			Tracks:  resolvedTracks,
-		}, nil
+		return p.resolveTracks(ctx, data)
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
 	}
+}
+
+func (p *AppPlayer) resolveTracks(ctx context.Context, data ApiRequestDataResolveTracks) (*ApiResponseResolveTracks, error) {
+	spotCtx, err := p.sess.Spclient().ContextResolve(ctx, data.Uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed resolving context: %w", err)
+	}
+
+	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, p.sess.Spclient(), spotCtx)
+	if err != nil {
+		return nil, fmt.Errorf("failed creating track list from context: %w", err)
+	}
+
+	allTracks, err := ctxTracks.AllTracksWithError(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed loading context tracks: %w", err)
+	}
+	total := len(allTracks)
+	offset := data.Offset
+	if offset > total {
+		offset = total
+	}
+	end := offset + data.Limit
+	if end > total {
+		end = total
+	}
+
+	resolvedTracks := make([]ApiResponseResolvedTrack, 0, end-offset)
+	for _, tr := range allTracks[offset:end] {
+		mapped := mapResolvedTrack(tr)
+		if mapped.Name == "" || len(mapped.Artists) == 0 || mapped.Img == "" {
+			enrichResolvedTrack(ctx, p, &mapped)
+		}
+		resolvedTracks = append(resolvedTracks, mapped)
+	}
+
+	return &ApiResponseResolveTracks{
+		Uri:     data.Uri,
+		Offset:  offset,
+		Limit:   data.Limit,
+		Total:   total,
+		HasNext: end < total,
+		Tracks:  resolvedTracks,
+	}, nil
 }
 
 func mapResolvedTrack(track *connectpb.ProvidedTrack) ApiResponseResolvedTrack {

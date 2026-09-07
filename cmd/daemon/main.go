@@ -13,8 +13,10 @@ import (
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
+	"github.com/devgianlu/go-librespot/login5"
 	"github.com/devgianlu/go-librespot/mpris"
 	"github.com/devgianlu/go-librespot/playplay"
+	login5pb "github.com/devgianlu/go-librespot/proto/spotify/login5/v3"
 
 	"github.com/devgianlu/go-librespot/apresolve"
 	"github.com/devgianlu/go-librespot/player"
@@ -189,10 +191,16 @@ func (app *App) Zeroconf(ctx context.Context) error {
 		if app.cfg.Credentials.Zeroconf.PersistCredentials && len(app.state.Credentials.Data) > 0 {
 			app.log.WithField("username", librespot.ObfuscateUsername(app.state.Credentials.Username)).
 				Infof("loading previously persisted zeroconf credentials")
-			return app.newAppPlayer(ctx, session.StoredCredentials{
+			player, err := app.newAppPlayer(ctx, session.StoredCredentials{
 				Username: app.state.Credentials.Username,
 				Data:     app.state.Credentials.Data,
 			})
+			var loginErr *login5.LoginError
+			if errors.As(err, &loginErr) && loginErr.Code == login5pb.LoginError_INVALID_CREDENTIALS {
+				app.log.Warnf("saved credentials were rejected; waiting for Spotify Connect pairing")
+				return nil, nil
+			}
+			return player, err
 		}
 
 		return nil, nil

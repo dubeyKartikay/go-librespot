@@ -45,6 +45,50 @@ components:
           description: Start playback as paused
           type: boolean
 paths:
+  /browse/{operation}:
+    get:
+      summary: Browse Spotify using the paired daemon session
+      description: See BROWSING.md for item shapes and backing private operations.
+      parameters:
+        - name: operation
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [user, first-track, playlists, tracks, albums, artists, artist-albums, album-tracks, search-playlists, search-tracks, search-albums, search-artists]
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+        - name: uri
+          in: query
+          description: Required for artist-albums and album-tracks.
+          schema:
+            type: string
+        - name: q
+          in: query
+          description: Required for search operations.
+          schema:
+            type: string
+      responses:
+        200:
+          description: User ID, first track URI, or a page with items, total, offset and limit.
+        204:
+          description: No paired session.
+        400:
+          description: Invalid operation or parameters.
+        404:
+          description: No first saved track.
+        500:
+          description: Upstream or private protocol failure.
   /:
     get:
       description: Returns API reachability and playback readiness

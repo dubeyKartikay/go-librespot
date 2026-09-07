@@ -442,6 +442,7 @@ func jsonDecode(r *http.Request, v any) error {
 
 func (s *ConcreteApiServer) serve() {
 	m := http.NewServeMux()
+	s.registerBrowseRoutes(m)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			w.WriteHeader(http.StatusMethodNotAllowed)

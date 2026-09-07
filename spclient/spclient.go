@@ -74,7 +74,9 @@ func (c *Spclient) innerRequest(ctx context.Context, method string, reqUrl *url.
 	req.Header.Set("Client-Token", c.clientToken)
 
 	if body != nil {
-		req.Header.Set("Content-Type", "application/x-protobuf")
+		if req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/x-protobuf")
+		}
 
 		req.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(body)), nil

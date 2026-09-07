@@ -76,6 +76,16 @@ func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) 
 }
 
 func (tl *List) AllTracks(ctx context.Context) []*connectpb.ProvidedTrack {
+	tracks, err := tl.AllTracksWithError(ctx)
+	if err != nil {
+		tl.log.WithError(err).Error("failed fetching all tracks")
+	}
+	return tracks
+}
+
+// AllTracksWithError lets browsing callers distinguish a partial download from
+// a complete library, so they do not report a false total or silently drop pages.
+func (tl *List) AllTracksWithError(ctx context.Context) ([]*connectpb.ProvidedTrack, error) {
 	tracks := make([]*connectpb.ProvidedTrack, 0, tl.tracks.len())
 
 	iter := tl.tracks.iterStart()
@@ -84,11 +94,7 @@ func (tl *List) AllTracks(ctx context.Context) []*connectpb.ProvidedTrack {
 		tracks = append(tracks, librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), curr.item))
 	}
 
-	if err := iter.error(); err != nil {
-		tl.log.WithError(err).Error("failed fetching all tracks")
-	}
-
-	return tracks
+	return tracks, iter.error()
 }
 
 const MaxTracksInContext = 32
