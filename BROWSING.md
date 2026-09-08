@@ -35,7 +35,8 @@ and response shapes were checked against the examples in
 [spotube-plugin-spotify](https://github.com/sonic-liberation/spotube-plugin-spotify/tree/47d0a1051b576616f9e823cc756b84e8dc1a53f4/.bruno/Spotify%20GQL).
 No client implementation was copied.
 
-Use `credentials.type: zeroconf` and
-`credentials.zeroconf.persist_credentials: true` for pairing. Rejected
-legacy login5 credentials fall back to waiting for Spotify Connect pairing,
-while other startup failures still propagate.
+Use `credentials.type: device_auth` for pairing. `GET /auth/code` exposes the
+pending URL, code, and expiry before a session exists. A 204 response means
+there is no pending code. Credentials are saved using upstream's state store.
+Rejected legacy login5 credentials trigger a fresh device authorization;
+network failures still propagate without discarding stored credentials.

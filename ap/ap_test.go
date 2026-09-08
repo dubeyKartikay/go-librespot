@@ -1,14 +1,17 @@
+//go:build test_unit
+
 package ap
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	librespot "github.com/devgianlu/go-librespot"
 )
 
@@ -17,36 +20,15 @@ type stubAddr string
 func (a stubAddr) Network() string { return string(a) }
 func (a stubAddr) String() string  { return string(a) }
 
-type countingConn struct {
-	mu     sync.Mutex
-	closes int
-}
-
-func (c *countingConn) Read([]byte) (int, error)         { return 0, io.EOF }
-func (c *countingConn) Write(b []byte) (int, error)      { return len(b), nil }
-func (c *countingConn) Close() error                     { c.mu.Lock(); c.closes++; c.mu.Unlock(); return nil }
-func (c *countingConn) LocalAddr() net.Addr              { return stubAddr("local") }
-func (c *countingConn) RemoteAddr() net.Addr             { return stubAddr("remote") }
-func (c *countingConn) SetDeadline(time.Time) error      { return nil }
-func (c *countingConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *countingConn) SetWriteDeadline(time.Time) error { return nil }
-
-func (c *countingConn) CloseCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closes
-}
-
 type blockingConn struct {
-	started sync.Once
-	startCh chan struct{}
-	blockCh chan struct{}
+	startCh  chan struct{}
+	closedCh chan struct{}
 }
 
 func newBlockingConn() *blockingConn {
 	return &blockingConn{
-		startCh: make(chan struct{}),
-		blockCh: make(chan struct{}),
+		startCh:  make(chan struct{}),
+		closedCh: make(chan struct{}),
 	}
 }
 
@@ -57,76 +39,68 @@ func (c *blockingConn) SetDeadline(time.Time) error      { return nil }
 func (c *blockingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *blockingConn) SetWriteDeadline(time.Time) error { return nil }
 
-func (c *blockingConn) Write(b []byte) (int, error) {
-	c.started.Do(func() { close(c.startCh) })
-	<-c.blockCh
-	return len(b), nil
+func (c *blockingConn) Write([]byte) (int, error) {
+	close(c.startCh)
+	<-c.closedCh
+	return 0, io.ErrClosedPipe
 }
 
 func (c *blockingConn) Close() error {
+	close(c.closedCh)
 	return nil
 }
 
-func TestPongAckTickerDoesNotPanicWhenConnNil(t *testing.T) {
+func TestPongAckTickerStopsWhenConnNil(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ap := NewAccesspoint(&librespot.NullLogger{}, nil, "")
+		stopped := make(chan struct{})
 
-		panicCh := make(chan any, 1)
 		go func() {
-			defer func() {
-				panicCh <- recover()
-			}()
+			defer close(stopped)
 			ap.pongAckTicker()
 		}()
 
 		time.Sleep(pongAckInterval + time.Nanosecond)
 		synctest.Wait()
 
-		select {
-		case p := <-panicCh:
-			if p != nil {
-				t.Fatalf("pongAckTicker panicked when conn was nil: %v", p)
-			}
-		default:
-		}
-
-		ap.pongAckTickerStop <- struct{}{}
+		ap.Close()
 		synctest.Wait()
 
 		select {
-		case p := <-panicCh:
-			if p != nil {
-				t.Fatalf("pongAckTicker panicked when conn was nil: %v", p)
-			}
+		case <-stopped:
 		default:
 			t.Fatal("pongAckTicker did not stop")
 		}
 	})
 }
 
-func TestCloseStopsPongAckTickerWhenConnNil(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ap := NewAccesspoint(&librespot.NullLogger{}, nil, "")
-		done := make(chan struct{})
+func TestDoneChannelClosesOnClose(t *testing.T) {
+	ap := NewAccesspoint(&librespot.NullLogger{}, nil, "")
 
-		go func() {
-			defer close(done)
-			ap.pongAckTicker()
-		}()
+	select {
+	case <-ap.Done():
+		t.Fatal("done channel should remain open before Close")
+	default:
+	}
 
-		synctest.Wait()
-		ap.Close()
-		synctest.Wait()
+	ap.Close()
 
-		select {
-		case <-done:
-		default:
-			t.Fatal("pongAckTicker did not stop when closing with nil conn")
-		}
-	})
+	select {
+	case <-ap.Done():
+	default:
+		t.Fatal("done channel did not close")
+	}
+
+	ap.Close()
+
+	select {
+	case <-ap.Done():
+	default:
+		t.Fatal("done channel should stay closed after repeated Close")
+	}
 }
 
-func TestCloseWaitsForInFlightSend(t *testing.T) {
+func TestCloseSignalsAndUnblocksInFlightSend(t *testing.T) {
 	conn := newBlockingConn()
 	ap := NewAccesspoint(&librespot.NullLogger{}, nil, "")
 	ap.conn = conn
@@ -150,25 +124,60 @@ func TestCloseWaitsForInFlightSend(t *testing.T) {
 	}()
 
 	select {
-	case <-closeDone:
-		t.Fatal("close returned before in-flight send finished")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	close(conn.blockCh)
-
-	select {
-	case err := <-sendDone:
-		if err != nil {
-			t.Fatalf("send error = %v", err)
-		}
+	case <-ap.Done():
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for send to finish")
+		t.Fatal("timed out waiting for done channel to close")
 	}
 
 	select {
 	case <-closeDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for close to finish")
+	}
+
+	select {
+	case err := <-sendDone:
+		if !errors.Is(err, ErrAccesspointClosed) {
+			t.Fatalf("expected ErrAccesspointClosed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for send to finish")
+	}
+}
+
+// A reconnect waiting out its backoff has to give up as soon as the
+// accesspoint is closed. Without a context on the retry it keeps going for the
+// backoff's own budget — 15 minutes by default — while holding connMu, which
+// stalls shutdown and blocks every Send behind it.
+func TestCloseCancelsReconnectBackoff(t *testing.T) {
+	ap := NewAccesspoint(&librespot.NullLogger{}, nil, "")
+
+	attempted := make(chan struct{}, 1)
+	retryDone := make(chan error, 1)
+	go func() {
+		retryDone <- backoff.Retry(func() error {
+			select {
+			case attempted <- struct{}{}:
+			default:
+			}
+			return errors.New("accesspoint still unreachable")
+		}, backoff.WithContext(backoff.NewExponentialBackOff(), ap.ctx))
+	}()
+
+	select {
+	case <-attempted:
+	case <-time.After(time.Second):
+		t.Fatal("retry never ran")
+	}
+
+	ap.Close()
+
+	select {
+	case err := <-retryDone:
+		if err == nil {
+			t.Fatal("expected the cancelled retry to report an error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect backoff kept running after Close")
 	}
 }

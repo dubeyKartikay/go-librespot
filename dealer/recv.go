@@ -43,12 +43,16 @@ type RequestPayload struct {
 	MessageId      uint32 `json:"message_id"`
 	SentByDeviceId string `json:"sent_by_device_id"`
 	Command        struct {
-		Endpoint         string                    `json:"endpoint"`
-		SessionId        string                    `json:"session_id"`
-		Data             []byte                    `json:"data"`
-		Value            interface{}               `json:"value"`
-		Position         int64                     `json:"position"`
-		Relative         string                    `json:"relative"`
+		Endpoint  string      `json:"endpoint"`
+		SessionId string      `json:"session_id"`
+		Data      []byte      `json:"data"`
+		Value     interface{} `json:"value"`
+		Position  int64       `json:"position"`
+		Relative  string      `json:"relative"`
+		TimerType *struct {
+			Type      string `json:"type"`
+			DurationS int64  `json:"duration_s"`
+		} `json:"timer_type"`
 		Context          *connectpb.Context        `json:"context"`
 		PlayOrigin       *connectpb.PlayOrigin     `json:"play_origin"`
 		Track            *connectpb.ContextTrack   `json:"track"`
@@ -93,6 +97,13 @@ type RequestPayload struct {
 		} `json:"play_options"`
 		FromDeviceIdentifier string `json:"from_device_identifier"`
 	} `json:"command"`
+
+	// RawCommand holds the command object's raw JSON, populated separately
+	// from Command above (see handleRequest). Command only exposes the
+	// fields we've modeled; a payload field we haven't added yet silently
+	// disappears on unmarshal otherwise, which makes an unhandled command's
+	// actual shape impossible to inspect from Command alone.
+	RawCommand json.RawMessage `json:"-"`
 }
 
 func handleTransferEncoding(headers map[string]string, data []byte) ([]byte, error) {
@@ -188,11 +199,13 @@ func (d *Dealer) ReceiveMessage(uriPrefixes ...string) <-chan Message {
 	}
 
 	d.connMu.RLock()
-	if d.closed {
+	select {
+	case <-d.done:
 		d.connMu.RUnlock()
 		c := make(chan Message)
 		close(c)
 		return c
+	default:
 	}
 
 	d.messageReceiversLock.Lock()
@@ -230,29 +243,47 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
 		return
 	}
 
+	// keep the command's raw JSON around too, so a command we don't model
+	// yet can still be inspected in full (see RawCommand)
+	var rawEnvelope struct {
+		Command json.RawMessage `json:"command"`
+	}
+	_ = json.Unmarshal(payloadBytes, &rawEnvelope)
+	payload.RawCommand = rawEnvelope.Command
+
 	// dispatch request
-	resp := make(chan bool)
-	recv.c <- Request{
+	resp := make(chan bool, 1)
+	select {
+	case recv.c <- Request{
 		resp:         resp,
 		MessageIdent: rawMsg.MessageIdent,
 		Payload:      payload,
+	}:
+	case <-d.done:
+		return
 	}
 
 	// wait for response and send it
-	success := <-resp
-	if err := d.sendReply(rawMsg.Key, success); err != nil {
-		log.WithError(err).Error("failed sending dealer reply")
+	select {
+	case success := <-resp:
+		if err := d.sendReply(rawMsg.Key, success); err != nil {
+			log.WithError(err).Error("failed sending dealer reply")
+			return
+		}
+	case <-d.done:
 		return
 	}
 }
 
 func (d *Dealer) ReceiveRequest(uri string) <-chan Request {
 	d.connMu.RLock()
-	if d.closed {
+	select {
+	case <-d.done:
 		d.connMu.RUnlock()
 		c := make(chan Request)
 		close(c)
 		return c
+	default:
 	}
 
 	d.requestReceiversLock.Lock()

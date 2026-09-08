@@ -1,4 +1,4 @@
-package main
+package daemon
 
 import (
 	"bytes"
@@ -7,8 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
-	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -27,6 +27,7 @@ import (
 	extmetadatapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 	"github.com/devgianlu/go-librespot/session"
+	"github.com/devgianlu/go-librespot/spclient"
 	"github.com/devgianlu/go-librespot/tracks"
 )
 
@@ -34,12 +35,21 @@ type AppPlayer struct {
 	app  *App
 	sess *session.Session
 
-	stop   chan struct{}
-	logout chan *AppPlayer
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	stop      chan struct{}
+	closeOnce sync.Once
+	logout    chan *AppPlayer
 
 	player            *player.Player
 	initialVolumeOnce sync.Once
 	volumeUpdate      chan float32
+
+	stateTimer        *time.Timer
+	stateDirty        bool
+	statePutScheduled bool
+	lastStatePut      time.Time
 
 	spotConnId string
 
@@ -56,7 +66,40 @@ type AppPlayer struct {
 	primaryStream   *player.Stream
 	secondaryStream *player.Stream
 
+	// secondarySource is what the player was handed as the secondary.
+	secondarySource librespot.AudioSource
+
+	// narrationJumped records that the upcoming track is being reached by
+	// jumping straight to it, so a DJ context introduces it with its jump line
+	// rather than the one for arriving in sequence. Consumed by the next load.
+	narrationJumped bool
+
+	// resumeFinishedPlaybackId is the playback id of the stream most recently
+	// reported as listened to the end, so that unloading it cannot overwrite
+	// that with a position a moment short of the end.
+	resumeFinishedPlaybackId []byte
+
 	prefetchTimer *time.Timer
+
+	// sleepTimer fires the duration requested by the most recent
+	// set_sleep_timer command, pausing playback. Stopped/reset (never left
+	// to fire) by a later set_sleep_timer call, matching the "only one timer
+	// active at a time" behavior of Spotify's own clients.
+	sleepTimer *time.Timer
+
+	// sleepAtEndOfTrack is set by a set_sleep_timer command whose timer_type
+	// is "end_of_track": rather than a duration to wait, playback is meant
+	// to stop when the current track naturally finishes. Checked (and
+	// cleared) in the EventTypeNotPlaying handler, in place of the usual
+	// advance to the next track. Mutually exclusive with sleepTimer - only
+	// one sleep timer mode is active at a time.
+	sleepAtEndOfTrack bool
+
+	// consecutiveUnplayableSkips bounds how many unplayable tracks in a row advanceNext will
+	// skip past (Spotify-refused audio keys / restricted media) before giving up — so a run
+	// of refused tracks (even at the very start of a context) advances to the first playable
+	// one instead of freezing, and can never loop forever. Reset to 0 on any successful load.
+	consecutiveUnplayableSkips int
 }
 
 func (p *AppPlayer) playbackReady() bool {
@@ -224,17 +267,19 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
 		p.state.player.ContextRestrictions = transferState.CurrentSession.Context.Restrictions
 		p.state.player.Suppressions = transferState.CurrentSession.Suppressions
 
-		p.state.player.ContextMetadata = map[string]string{}
-		for k, v := range transferState.CurrentSession.Context.Metadata {
-			p.state.player.ContextMetadata[k] = v
-		}
-		for k, v := range ctxTracks.Metadata() {
-			p.state.player.ContextMetadata[k] = v
-		}
+		p.state.player.ContextMetadata = contextMetadata(transferState.CurrentSession.Context.Metadata, ctxTracks.Metadata())
 
+		// Claim the transfer before doing anything slow.
 		contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(p.state.player.ContextUri)
-		currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
-		if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
+		p.state.player.Track = librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
+		p.state.player.IsPlaying = true
+		p.state.player.IsBuffering = true
+		p.state.player.PlaybackSpeed = 0 // not progressing while buffering
+		p.flushState(ctx)
+
+		// Seek to the transferred track, playing it ahead of the context if it
+		// cannot be located.
+		if err := ctxTracks.TrySeekTo(ctx, transferState.Playback.CurrentTrack); err != nil {
 			return fmt.Errorf("failed seeking to track: %w", err)
 		}
 
@@ -273,8 +318,9 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
 		p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
 		p.state.player.Index = ctxTracks.Index()
 
-		// load current track into stream
-		if err := p.loadCurrentTrack(ctx, pause, true); err != nil {
+		// load current track into stream — skip forward if the transferred track is unplayable
+		// (Spotify refused its key / restricted), so a cast onto a refused track doesn't freeze.
+		if err := p.loadCurrentTrackOrSkip(ctx, pause, true); err != nil {
 			return fmt.Errorf("failed loading current track (transfer): %w", err)
 		}
 
@@ -386,7 +432,56 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
 	case "add_to_queue":
 		p.addToQueue(ctx, req.Command.Track)
 		return nil
+	case "set_sleep_timer":
+		// Only one timer (of either mode) is active at a time: stop/drain
+		// the duration timer and clear the end-of-track flag before
+		// possibly setting either, matching Spotify's own clients (a new
+		// call replaces, not stacks with, an earlier one, of either mode).
+		if !p.sleepTimer.Stop() {
+			select {
+			case <-p.sleepTimer.C:
+			default:
+			}
+		}
+		p.sleepAtEndOfTrack = false
+
+		// Setting the timer alone has no visible effect on its own: the
+		// Spotify app doesn't track this locally, it reads back whether (and
+		// when) a timer is active from PlayerState.SleepTimer, so that has
+		// to be kept in sync for the app to show anything at all.
+		tt := req.Command.TimerType
+		switch {
+		case tt != nil && tt.Type == "duration" && tt.DurationS > 0:
+			duration := time.Duration(tt.DurationS) * time.Second
+			p.sleepTimer.Reset(duration)
+			p.state.player.SleepTimer = &connectpb.SleepTimer{
+				TimerType: &connectpb.SleepTimer_Timestamp_{
+					Timestamp: &connectpb.SleepTimer_Timestamp{
+						Timestamp: time.Now().Add(duration).UnixMilli(),
+					},
+				},
+			}
+		case tt != nil && tt.Type == "end_of_track":
+			p.sleepAtEndOfTrack = true
+			p.state.player.SleepTimer = &connectpb.SleepTimer{
+				TimerType: &connectpb.SleepTimer_EndOfTrack_{
+					EndOfTrack: &connectpb.SleepTimer_EndOfTrack{},
+				},
+			}
+		default:
+			// "clear" is Spotify's own cancel signal. Anything else we don't
+			// recognize is logged rather than silently treated as a cancel,
+			// so its actual wire shape can be captured.
+			if tt != nil && tt.Type != "" && tt.Type != "clear" {
+				p.app.log.Warnf("unsupported set_sleep_timer timer_type payload: %s", req.RawCommand)
+			}
+			p.state.player.SleepTimer = nil
+		}
+
+		p.updateState(ctx)
+		return nil
 	default:
+		p.app.log.Warnf("unsupported player command %q payload: %s", req.Command.Endpoint, req.RawCommand)
 		return fmt.Errorf("unsupported player command: %s", req.Command.Endpoint)
 	}
 }
@@ -413,50 +508,17 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	switch req.Type {
 	case "browse":
 		return p.browse(ctx, req.Data.(browseRequest))
-	case ApiRequestTypeRoot:
-		return &ApiResponseRoot{PlaybackReady: p.playbackReady()}, nil
-	case ApiRequestTypeWebApi:
-		data := req.Data.(ApiRequestDataWebApi)
-		resp, err := p.sess.WebApi(ctx, data.Method, data.Path, data.Query, nil, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to send web api request: %w", err)
-		}
-
-		defer func() { _ = resp.Body.Close() }()
-
-		// this is the status we want to return to client not just 500
-		switch resp.StatusCode {
-		case 400:
+	case ApiRequestTypeResolveTracks:
+		data := req.Data.(ApiRequestDataResolveTracks)
+		id, err := librespot.SpotifyIdFromUri(data.Uri)
+		if err != nil || id.Type() != librespot.SpotifyIdTypePlaylist {
 			return nil, ErrBadRequest
-		case 403:
-			return nil, ErrForbidden
-		case 404:
-			return nil, ErrNotFound
-		case 405:
-			return nil, ErrMethodNotAllowed
-		case 429:
-			return nil, ErrTooManyRequests
 		}
-
-		// check for content type if not application/json
-		if !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-			respBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read response body: %w", err)
-			}
-
-			return respBody, nil
-		}
-
-		// decode and return json
-		var respJson any
-		if err = json.NewDecoder(resp.Body).Decode(&respJson); err != nil {
-			return nil, fmt.Errorf("failed to decode response body: %w", err)
-		}
-
-		return respJson, nil
+		return p.resolveTracks(ctx, data)
+	case ApiRequestTypeRoot:
+		return &ApiRoot{PlaybackReady: p.playbackReady()}, nil
 	case ApiRequestTypeStatus:
-		resp := &ApiResponseStatus{
+		resp := &ApiStatus{
 			Username:       p.sess.Username(),
 			DeviceId:       p.app.deviceId,
 			DeviceType:     p.app.deviceType.String(),
@@ -473,7 +535,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 
 		if p.primaryStream != nil && p.prodInfo != nil {
-			resp.Track = p.newApiResponseStatusTrack(p.primaryStream.Media, p.state.trackPosition())
+			resp.Track = p.newApiResponseStatusTrack(p.primaryStream, p.state.trackPosition())
 		}
 
 		return resp, nil
@@ -483,6 +545,9 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 	case ApiRequestTypePause:
 		_ = p.pause(ctx)
 		return nil, nil
+	case ApiRequestTypeStop:
+		_ = p.stopPlayback(ctx)
+		return nil, nil
 	case ApiRequestTypePlayPause:
 		if p.state.player.IsPaused {
 			_ = p.play(ctx)
@@ -491,7 +556,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, nil
 	case ApiRequestTypeSeek:
-		data := req.Data.(ApiRequestDataSeek)
+		data := req.Data.(ApiSeek)
 
 		var position int64
 		if data.Relative {
@@ -506,7 +571,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		_ = p.skipPrev(ctx, true)
 		return nil, nil
 	case ApiRequestTypeNext:
-		data := req.Data.(ApiRequestDataNext)
+		data := req.Data.(ApiNext)
 		if data.Uri != nil {
 			_ = p.skipNext(ctx, &connectpb.ContextTrack{Uri: *data.Uri})
 		} else {
@@ -514,7 +579,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		}
 		return nil, nil
 	case ApiRequestTypePlay:
-		data := req.Data.(ApiRequestDataPlay)
+		data := req.Data.(ApiPlay)
 		spotCtx, err := p.sess.Spclient().ContextResolve(ctx, data.Uri)
 		if err != nil {
 			return nil, fmt.Errorf("failed resolving context: %w", err)
@@ -547,18 +612,33 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			}
 		}
 
-		if err := p.loadContext(ctx, spotCtx, skipTo, data.Paused, true); err != nil {
+		// When starting at a position, load paused and seek before unpausing so
+		// no audio plays from 0:00 while the track loads. loadContext returns
+		// once the track is loaded, so no polling is needed to time the seek.
+		loadPaused := data.Paused || data.Position > 0
+		if err := p.loadContext(ctx, spotCtx, skipTo, loadPaused, true); err != nil {
 			return nil, fmt.Errorf("failed loading context: %w", err)
+		}
+
+		if data.Position > 0 {
+			if err := p.seek(ctx, data.Position); err != nil {
+				p.app.log.WithError(err).Warnf("failed seeking to initial position %dms", data.Position)
+			}
+			if !data.Paused {
+				if err := p.play(ctx); err != nil {
+					p.app.log.WithError(err).Warnf("failed resuming after initial seek")
+				}
+			}
 		}
 
 		return nil, nil
 	case ApiRequestTypeGetVolume:
-		return &ApiResponseVolume{
+		return &ApiVolume{
 			Max:   p.app.cfg.VolumeSteps,
 			Value: p.apiVolume(),
 		}, nil
 	case ApiRequestTypeSetVolume:
-		data := req.Data.(ApiRequestDataVolume)
+		data := req.Data.(ApiSetVolume)
 
 		var volume int32
 		if data.Relative {
@@ -591,20 +671,27 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 		if err != nil {
 			return nil, fmt.Errorf("failed getting access token: %w", err)
 		}
-		return &ApiResponseToken{
+		return &ApiToken{
 			Token: accessToken,
 		}, nil
-	case ApiRequestTypeResolveTracks:
-		data := req.Data.(ApiRequestDataResolveTracks)
-
-		spotID, err := librespot.SpotifyIdFromUri(data.Uri)
-		if err != nil || spotID.Type() != librespot.SpotifyIdTypePlaylist {
-			return nil, ErrBadRequest
+	case ApiRequestSetDeviceName:
+		p.setDeviceName(ctx, req.Data.(string))
+		return nil, nil
+	case ApiRequestTypeReopenOutput:
+		if err := p.player.ReopenOutput(req.Data.(string)); err != nil {
+			return nil, fmt.Errorf("failed reopening output: %w", err)
 		}
-		return p.resolveTracks(ctx, data)
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
 	}
+}
+
+func (p *AppPlayer) setDeviceName(ctx context.Context, name string) {
+	p.app.SetDeviceName(name)
+
+	p.state.device.Name = name
+	p.updateState(ctx)
 }
 
 func (p *AppPlayer) resolveTracks(ctx context.Context, data ApiRequestDataResolveTracks) (*ApiResponseResolveTracks, error) {
@@ -713,9 +800,9 @@ func enrichResolvedTrack(ctx context.Context, p *AppPlayer, track *ApiResponseRe
 
 	if track.Img == "" && p.prodInfo != nil && trackMeta.GetAlbum() != nil {
 		album := trackMeta.GetAlbum()
-		coverId := getBestImageIdForSize(album.GetCover(), p.app.cfg.Server.ImageSize)
+		coverId := getBestImageIdForSize(album.GetCover(), p.app.cfg.ImageSize)
 		if coverId == nil && album.GetCoverGroup() != nil {
-			coverId = getBestImageIdForSize(album.GetCoverGroup().GetImage(), p.app.cfg.Server.ImageSize)
+			coverId = getBestImageIdForSize(album.GetCoverGroup().GetImage(), p.app.cfg.ImageSize)
 		}
 		if img := p.prodInfo.ImageUrl(coverId); img != nil {
 			track.Img = *img
@@ -863,14 +950,20 @@ func (p *AppPlayer) handleMprisEvent(ctx context.Context, req mpris.MediaPlayer2
 	return nil
 }
 
+// Close stops the player and releases its session. It may be called while Run
+// is still busy serving a command, so it must not assume Run reacts promptly:
+// cancelling the context is what actually unblocks in-flight requests.
 func (p *AppPlayer) Close() {
-	p.stop <- struct{}{}
-	p.player.Close()
-	p.sess.Close()
+	p.closeOnce.Do(func() {
+		p.cancel()
+		p.stop <- struct{}{}
+		p.player.Close()
+		p.sess.Close()
+	})
 }
 
-func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
-	err := p.sess.Dealer().Connect(ctx)
+func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
+	err := p.sess.Dealer().Connect(p.ctx)
 	if err != nil {
 		p.app.log.WithError(err).Error("failed connecting to dealer")
 		p.Close()
@@ -885,12 +978,42 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 	volumeTimer := time.NewTimer(time.Minute)
 	volumeTimer.Stop() // don't emit a volume change event at start
 
+	p.stateTimer = time.NewTimer(time.Minute)
+	p.stateTimer.Stop() // armed on demand by updateState
+
+	// The accesspoint and the dealer only close their receivers after giving
+	// up on reconnecting, so losing either means the session is gone for good
+	// and cannot recover on its own. sessionLost hands the player back to the
+	// daemon to be torn down and rebuilt, exactly as a remote logout does.
+	sessionLost := false
+	loseSession := func() (stop bool) {
+		if sessionLost {
+			return false
+		}
+		sessionLost = true
+
+		p.app.log.Warn("lost session, tearing down player to start a new one")
+
+		select {
+		case p.logout <- p:
+			// The daemon calls Close, which signals p.stop and ends this loop.
+			return false
+		case <-p.stop:
+			// Already being torn down for another reason.
+			return true
+		}
+	}
+
 	for {
 		select {
 		case <-p.stop:
 			return
 		case pkt, ok := <-apRecv:
 			if !ok {
+				apRecv = nil
+				if loseSession() {
+					return
+				}
 				continue
 			}
 
@@ -899,18 +1022,26 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case msg, ok := <-msgRecv:
 			if !ok {
+				msgRecv = nil
+				if loseSession() {
+					return
+				}
 				continue
 			}
 
-			if err := p.handleDealerMessage(ctx, msg); err != nil {
+			if err := p.handleDealerMessage(p.ctx, msg); err != nil {
 				p.app.log.WithError(err).Warn("failed handling dealer message")
 			}
 		case req, ok := <-reqRecv:
 			if !ok {
+				reqRecv = nil
+				if loseSession() {
+					return
+				}
 				continue
 			}
 
-			if err := p.handleDealerRequest(ctx, req); err != nil {
+			if err := p.handleDealerRequest(p.ctx, req); err != nil {
 				p.app.log.WithError(err).Warn("failed handling dealer request")
 				req.Reply(false)
 			} else {
@@ -919,18 +1050,20 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			}
 		case req, ok := <-apiRecv:
 			if !ok {
+				apiRecv = nil
 				continue
 			}
 
-			data, err := p.handleApiRequest(ctx, req)
+			data, err := p.handleApiRequest(p.ctx, req)
 			req.Reply(data, err)
 		case mprisReq, ok := <-mprisRecv:
 			if !ok {
+				mprisRecv = nil
 				continue
 			}
 
 			p.app.log.Tracef("new mpris message %v", mprisReq)
-			err := p.handleMprisEvent(ctx, mprisReq)
+			err := p.handleMprisEvent(p.ctx, mprisReq)
 			dbusError := mpris.MediaPlayer2PlayerCommandResponse{
 				Err: &dbus.Error{},
 			}
@@ -942,12 +1075,21 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			mprisReq.Reply(dbusError)
 		case ev, ok := <-playerRecv:
 			if !ok {
+				playerRecv = nil
 				continue
 			}
 
-			p.handlePlayerEvent(ctx, &ev)
+			p.handlePlayerEvent(p.ctx, &ev)
 		case <-p.prefetchTimer.C:
-			p.prefetchNext(ctx)
+			p.prefetchNext(p.ctx)
+		case <-p.sleepTimer.C:
+			// Cleared before pause(), whose own updateState call picks this
+			// up - so the app stops showing the timer as active in the same
+			// state push that reports playback paused.
+			p.state.player.SleepTimer = nil
+			if err := p.pause(p.ctx); err != nil {
+				p.app.log.WithError(err).Warn("failed pausing playback for sleep timer")
+			}
 		case volume := <-p.volumeUpdate:
 			// Received a new volume: from Spotify Connect, from the REST API,
 			// or from the system volume mixer.
@@ -958,7 +1100,31 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			volumeTimer.Reset(100 * time.Millisecond)
 		case <-volumeTimer.C:
 			// We've gone some time without update, send the new value now.
-			p.volumeUpdated(ctx)
+			p.volumeUpdated(p.ctx)
+		case <-p.stateTimer.C:
+			p.statePutScheduled = false
+			if !p.stateDirty {
+				break
+			}
+			p.flushState(p.ctx)
+		}
+	}
+}
+
+// flushState PUTs the latest connect-state and records the send time. On a rate-limit it
+// schedules a coalesced resend after the cooldown. Runs on the Run goroutine.
+func (p *AppPlayer) flushState(ctx context.Context) {
+	p.stateDirty = false
+	p.lastStatePut = time.Now()
+	if err := p.putConnectState(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED); err != nil {
+		p.app.log.WithError(err).Error("failed put state after update")
+
+		// Rate-limited: resend the latest state after the cooldown instead of dropping it.
+		var rl *spclient.RateLimitedError
+		if errors.As(err, &rl) {
+			p.stateDirty = true
+			p.statePutScheduled = true
+			p.stateTimer.Reset(rl.RetryAfter)
 		}
 	}
 }

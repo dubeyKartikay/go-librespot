@@ -1,94 +1,93 @@
+//go:build test_unit
+
 package dealer
 
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/coder/websocket"
 	librespot "github.com/devgianlu/go-librespot"
 )
 
-func TestPingTickerDoesNotPanicWhenConnNil(t *testing.T) {
+func TestPingTickerStopsWhenConnNil(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
 		d := &Dealer{
-			log:            &librespot.NullLogger{},
-			pingTickerStop: make(chan struct{}, 1),
+			log:    &librespot.NullLogger{},
+			ctx:    ctx,
+			cancel: cancel,
+			done:   make(chan struct{}),
 		}
+		stopped := make(chan struct{})
 
-		panicCh := make(chan any, 1)
 		go func() {
-			defer func() {
-				panicCh <- recover()
-			}()
+			defer close(stopped)
 			d.pingTicker()
 		}()
 
-		time.Sleep(pingInterval + timeout + time.Nanosecond)
+		time.Sleep(pingInterval + time.Nanosecond)
+		synctest.Wait()
+
+		d.Close()
 		synctest.Wait()
 
 		select {
-		case p := <-panicCh:
-			if p != nil {
-				t.Fatalf("pingTicker panicked when conn was nil: %v", p)
-			}
-		default:
-		}
-
-		d.pingTickerStop <- struct{}{}
-		synctest.Wait()
-
-		select {
-		case p := <-panicCh:
-			if p != nil {
-				t.Fatalf("pingTicker panicked when conn was nil: %v", p)
-			}
+		case <-stopped:
 		default:
 			t.Fatal("pingTicker did not stop")
 		}
 	})
 }
 
-func TestCloseStopsPingTickerWhenConnNil(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		d := &Dealer{
-			log:            &librespot.NullLogger{},
-			pingTickerStop: make(chan struct{}, 1),
-		}
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			d.pingTicker()
-		}()
-
-		synctest.Wait()
-		d.Close()
-		synctest.Wait()
-
-		stopped := false
-		select {
-		case <-done:
-			stopped = true
-		default:
-		}
-
-		d.pingTickerStop <- struct{}{}
-		synctest.Wait()
-
-		if !stopped {
-			t.Fatal("pingTicker did not stop when closing with nil conn")
-		}
-	})
-}
-
 func TestWriteConnRejectsClosedDealer(t *testing.T) {
-	d := &Dealer{closed: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Dealer{ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	close(d.done)
 
 	_, err := d.writeConn(context.Background(), websocket.MessageText, nil)
 	if !errors.Is(err, ErrDealerClosed) {
 		t.Fatalf("expected ErrDealerClosed, got %v", err)
+	}
+}
+
+// Same as the accesspoint: a dealer reconnect sitting in its backoff must stop
+// when the dealer is closed rather than retrying for the backoff's own budget.
+func TestCloseCancelsReconnectBackoff(t *testing.T) {
+	d := NewDealer(&librespot.NullLogger{}, &http.Client{}, nil, nil)
+	d.log = &librespot.NullLogger{}
+
+	attempted := make(chan struct{}, 1)
+	retryDone := make(chan error, 1)
+	go func() {
+		retryDone <- backoff.Retry(func() error {
+			select {
+			case attempted <- struct{}{}:
+			default:
+			}
+			return errors.New("dealer still unreachable")
+		}, backoff.WithContext(backoff.NewExponentialBackOff(), d.ctx))
+	}()
+
+	select {
+	case <-attempted:
+	case <-time.After(time.Second):
+		t.Fatal("retry never ran")
+	}
+
+	d.Close()
+
+	select {
+	case err := <-retryDone:
+		if err == nil {
+			t.Fatal("expected the cancelled retry to report an error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect backoff kept running after Close")
 	}
 }
