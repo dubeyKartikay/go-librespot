@@ -4,6 +4,7 @@ package spclient_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -139,6 +140,15 @@ func (suite *RequestSuite) TestSetsProtobufContentTypeForBodies() {
 	suite.Require().Len(got, 1)
 	suite.Equal("application/x-protobuf", got[0].header.Get("Content-Type"))
 	suite.Equal([]byte("payload"), got[0].body)
+}
+
+func (suite *RequestSuite) TestKeepsCallerContentType() {
+	header := http.Header{"Content-Type": []string{"application/vnd.collection-v2.spotify.proto"}}
+	resp, err := suite.spclient.Request(suite.T().Context(), "POST", "/x", nil, header, []byte("payload"))
+	suite.Require().NoError(err)
+	defer func() { _ = resp.Body.Close() }()
+
+	suite.Equal("application/vnd.collection-v2.spotify.proto", suite.requests()[0].header.Get("Content-Type"))
 }
 
 func (suite *RequestSuite) TestNoContentTypeWithoutBody() {
@@ -362,6 +372,83 @@ func (suite *RequestSuite) TestPutConnectStateRejectsUnparseableCluster() {
 	suite.Contains(err.Error(), "failed unmarshalling Cluster")
 }
 
+// A context the backend will not resolve comes back typed, so a caller can tell
+// a refusal to this account from anything else without matching on the message.
+// Only final answers get this far: 5xx are retried by the request itself.
+func (suite *RequestSuite) TestContextResolveReportsTheStatus() {
+	const uri = "spotify:list:jam-list:163dc0978f246346e7f1d14a4dd2bb9d"
+
+	for _, tt := range []struct {
+		status int
+		denied bool
+	}{
+		{http.StatusForbidden, true},
+		{http.StatusNotFound, true},
+		{http.StatusBadRequest, false},
+	} {
+		suite.Run(http.StatusText(tt.status), func() {
+			suite.SetupTest()
+			defer suite.TearDownTest()
+
+			suite.handler = func(_ int, w http.ResponseWriter) { w.WriteHeader(tt.status) }
+
+			_, err := suite.spclient.ContextResolve(suite.T().Context(), uri)
+
+			var resolveErr *spclient.ContextResolveError
+			suite.Require().ErrorAs(fmt.Errorf("wrapped: %w", err), &resolveErr)
+			suite.Equal(tt.status, resolveErr.StatusCode)
+			suite.Equal(tt.denied, resolveErr.IsAccessDenied())
+			suite.Equal(fmt.Sprintf("invalid status code from context resolve: %d", tt.status), err.Error())
+			suite.Equal("/context-resolve/v1/"+uri, suite.requests()[0].path)
+		})
+	}
+}
+
+func (suite *RequestSuite) TestContextResolveUrlReportsTheStatus() {
+	const hm = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
+
+	suite.handler = func(_ int, w http.ResponseWriter) { w.WriteHeader(http.StatusForbidden) }
+
+	_, err := suite.spclient.ContextResolveUrl(suite.T().Context(), hm)
+
+	var resolveErr *spclient.ContextResolveError
+	suite.Require().ErrorAs(err, &resolveErr)
+	suite.Equal(http.StatusForbidden, resolveErr.StatusCode)
+	suite.True(resolveErr.IsAccessDenied())
+	suite.Equal("invalid status code from context resolve at "+hm+": 403", err.Error())
+}
+
 func TestRequestSuite(t *testing.T) {
 	suite.Run(t, new(RequestSuite))
+}
+
+// A request that is not idempotent may already have been applied when the
+// server or the network fails, so it is not sent again.
+func (suite *RequestSuite) TestRequestOnceDoesNotRepeatTransientFailures() {
+	suite.handler = func(_ int, w http.ResponseWriter) { w.WriteHeader(http.StatusServiceUnavailable) }
+
+	resp, err := suite.spclient.RequestOnce(suite.T().Context(), "POST", "/x", nil, nil, []byte("change"))
+	suite.Require().NoError(err)
+	defer func() { _ = resp.Body.Close() }()
+
+	suite.Equal(http.StatusServiceUnavailable, resp.StatusCode, "the caller sees the status")
+	suite.Len(suite.requests(), 1, "sent once")
+}
+
+// A 401 means the server refused the request, so renewing the token and
+// sending it again is safe even when it is not idempotent.
+func (suite *RequestSuite) TestRequestOnceStillRenewsTheToken() {
+	suite.handler = func(attempt int, w http.ResponseWriter) {
+		if attempt == 0 {
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}
+
+	resp, err := suite.spclient.RequestOnce(suite.T().Context(), "POST", "/x", nil, nil, []byte("change"))
+	suite.Require().NoError(err)
+	defer func() { _ = resp.Body.Close() }()
+
+	suite.Equal(http.StatusOK, resp.StatusCode)
+	suite.Len(suite.requests(), 2)
+	suite.Equal("Bearer fresh-token", suite.requests()[1].header.Get("Authorization"))
 }

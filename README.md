@@ -22,17 +22,19 @@
 ## Features
 
 - 🎵 **Spotify Connect** — show up as a speaker in the Spotify app and stream to it from any device on your network (Spotify Premium required).
-- 🔊 **Multiple audio backends** — ALSA, PulseAudio, WASAPI on Windows, or a raw named pipe for custom routing.
+- 🔊 **Multiple audio backends** — ALSA, PulseAudio, AudioToolbox on macOS, WASAPI on Windows, or a raw named pipe for custom routing.
 - 📊 **Loudness normalization** — Spotify-standard −14 LUFS (ITU-R BS.1770) with configurable pregain.
 - 🔀 **Crossfade** — configurable overlap between consecutive tracks.
 - 🎙️ **Podcast resume** — episodes pick up where you left off, and progress syncs back to your other devices.
 - 🎧 **DJ X** — Spotify's AI DJ, narration included: the spoken lines are synthesized and played around each track.
+- 👥 **Jam** — host a Spotify Jam on the speaker and let others join: what they add, skip and pause reaches it, and the song keeps playing through every change.
 - 🎚️ **Flexible volume control** — independent, synchronized with the ALSA mixer, or fully external.
 - 💾 **On-disk audio cache** — skip re-downloading tracks, bounded by an LRU size limit.
 - 🔐 **Multiple login flows** — Zeroconf discovery, interactive OAuth, or a Spotify access token.
 - 📡 **Selectable mDNS backend** — the built-in responder or the system Avahi daemon.
 - 🌐 **REST API + WebSocket events** — control and monitor playback programmatically.
 - 🖥️ **MPRIS integration** — control playback over D-Bus / standard Linux media keys.
+- 🍎 **macOS Now Playing** — media keys, headphone buttons and the Now Playing widget, with the track and its cover (`mpris_enabled: true`).
 - 🪶 **Lightweight & portable** — a single Go binary, ideal for Raspberry Pi and other embedded devices.
 
 ## Getting Started
@@ -227,6 +229,22 @@ cache:
   size_limit: '1GB' # Maximum total cache size before evicting least-recently-used files ('0' for unlimited)
 ```
 
+### Track metadata cache
+
+Optionally, the daemon can cache track metadata (name, artists, cover art) in memory and fetch it — via the same
+internal API playback uses, not the rate-limited public Web API — for the tracks around the playback position. This
+enables a `next_track` field in `GET /status` and a `GET /context/tracks?uri=...` endpoint that lists any playable
+context (playlist, album, artist) in order with metadata, so a client can render a browsable song list and start any
+entry via `POST /player/play` with `skip_to_uri`. Everything is opt-in and disabled by default: a headless speaker has
+no use for metadata beyond the playing track and should not pay network requests for it.
+
+```yaml
+metadata:
+  enabled: false # Cache + fetch metadata around the playback position; enables next_track and /context/tracks
+  context_sweep: false # Also resolve metadata for the whole context when one starts playing (requires enabled)
+  max_tracks: 800 # Maximum number of tracks of a context to enumerate and sweep; the metadata cache grows to fit it
+```
+
 ### Volume synchronization
 
 Various configurations for volume control are available:
@@ -271,7 +289,7 @@ log_disable_timestamp: false # Whether to disable timestamps in log output
 device_id: '' # Spotify device ID (auto-generated)
 device_name: '' # Spotify device name
 device_type: computer # Spotify device type (icon)
-audio_backend: alsa # Audio backend to use (alsa, pipe, pulseaudio, audio-toolbox, wasapi). Default is alsa, or wasapi on Windows.
+audio_backend: alsa # Default: audio-toolbox on macOS, wasapi on Windows, alsa elsewhere. Can also use pipe or pulseaudio.
 audio_backend_runtime_socket: '' # Audio backends' runtime socket to use, if backend is pulseaudio
 audio_device: default # ALSA audio device to use for playback
 mixer_device: '' # ALSA mixer device for volume synchronization 
@@ -283,6 +301,7 @@ audio_output_pipe_format: s16le # Audio output pipe format (s16le, s32le, f32le)
 audio_output_pipe_wait_for_reader: false # Whether to wait for a reader to connect to the FIFO before starting playback (see below)
 bitrate: 160 # Playback bitrate (96, 160, 320)
 crossfade_duration: 0 # Crossfade duration between tracks in milliseconds (0 to disable)
+skip_debounce_ms: 600 # Coalesce rapid next/prev presses; the selected track loads once presses stop (0 to disable)
 volume_steps: 100 # Volume steps count
 initial_volume: 100 # Initial volume in steps (not applied to the mixer device)
 ignore_last_volume: false # Whether to ignore the last saved volume and always use initial_volume

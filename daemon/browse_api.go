@@ -64,17 +64,17 @@ func parseBrowseRequest(r *http.Request) (browseRequest, error) {
 	return d, nil
 }
 
-func (p *AppPlayer) browse(ctx context.Context, d browseRequest) (any, error) {
+func (b sessionBrowser) browse(ctx context.Context, d browseRequest) (any, error) {
 	if d.Kind == "user" {
-		return map[string]string{"id": p.sess.Username()}, nil
+		return map[string]string{"id": b.username}, nil
 	}
 	if d.Kind == "tracks" || d.Kind == "first-track" {
 		if d.Kind == "first-track" {
 			d.Offset, d.Limit = 0, 1
 		}
 		// Liked songs are a Spotify context, resolved using the same protocol as playlists.
-		uri := "spotify:user:" + p.sess.Username() + ":collection"
-		resolved, err := p.resolveTracks(ctx, ApiRequestDataResolveTracks{Uri: uri, Offset: d.Offset, Limit: d.Limit})
+		uri := "spotify:user:" + b.username + ":collection"
+		resolved, err := b.resolveTracks(ctx, ApiRequestDataResolveTracks{Uri: uri, Offset: d.Offset, Limit: d.Limit})
 		if err != nil {
 			return nil, err
 		}
@@ -97,5 +97,5 @@ func (p *AppPlayer) browse(ctx context.Context, d browseRequest) (any, error) {
 		}
 		return map[string]any{"items": items, "offset": resolved.Offset, "limit": resolved.Limit, "total": resolved.Total}, nil
 	}
-	return p.sess.Spclient().Browse(ctx, d.Kind, d.URI, d.Query, d.Offset, d.Limit)
+	return b.sp.Browse(ctx, d.Kind, d.URI, d.Query, d.Offset, d.Limit)
 }

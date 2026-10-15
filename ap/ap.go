@@ -28,6 +28,11 @@ import (
 
 const pongAckInterval = 120 * time.Second
 
+// handshakeTimeout bounds the key exchange, challenge and authentication when the caller's
+// context has no deadline: an accesspoint that stops answering mid-handshake would otherwise
+// hold the connection until it drops it, minutes later.
+var handshakeTimeout = 30 * time.Second
+
 var ErrAccesspointClosed = errors.New("accesspoint closed")
 
 type AccesspointLoginError struct {
@@ -229,10 +234,12 @@ func (ap *Accesspoint) connect(ctx context.Context, creds *pb.LoginCredentials) 
 		return err
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = ap.conn.SetDeadline(deadline)
-		defer func() { _ = ap.conn.SetDeadline(time.Time{}) }()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(handshakeTimeout)
 	}
+	_ = ap.conn.SetDeadline(deadline)
+	defer func() { _ = ap.conn.SetDeadline(time.Time{}) }()
 
 	// perform key exchange with diffiehellman
 	exchangeData, err := ap.performKeyExchange()
@@ -285,8 +292,15 @@ func (ap *Accesspoint) Send(ctx context.Context, pktType PacketType, payload []b
 	return nil
 }
 
+// recvChanSize buffers each receiver so that recvLoop can keep draining the
+// socket while a consumer is busy. recvLoop is also the goroutine that answers
+// pings and hands audio keys to the key provider, so a consumer that blocks it
+// stalls key delivery to every other consumer — and a consumer waiting on a key
+// then cannot make progress either.
+const recvChanSize = 32
+
 func (ap *Accesspoint) Receive(types ...PacketType) <-chan Packet {
-	ch := make(chan Packet)
+	ch := make(chan Packet, recvChanSize)
 	ap.connMu.RLock()
 	select {
 	case <-ap.done:
@@ -355,7 +369,11 @@ loop:
 
 				handled := false
 				for _, ch := range ll {
-					ch <- Packet{Type: pkt, Payload: payload}
+					select {
+					case ch <- Packet{Type: pkt, Payload: payload}:
+					case <-ap.done:
+						break loop
+					}
 					handled = true
 				}
 
