@@ -36,6 +36,32 @@ func (suite *TrackListInternalSuite) SetupTest() {
 	suite.list = newTrackList(&librespot.NullLogger{}, suite.resolver)
 }
 
+func (suite *TrackListInternalSuite) TestAllTracksWithErrorFetchesEveryPage() {
+	suite.resolver.EXPECT().Page(mock.Anything, 0).
+		Return([]*connectpb.ContextTrack{{Uri: trackUri(0)}, {Uri: trackUri(1)}}, nil).Once()
+	suite.resolver.EXPECT().Page(mock.Anything, 1).
+		Return([]*connectpb.ContextTrack{{Uri: trackUri(2)}}, nil).Once()
+	suite.resolver.EXPECT().Page(mock.Anything, 2).Return(nil, io.EOF).Once()
+
+	all, err := suite.list.AllTracksWithError(context.Background())
+	suite.Require().NoError(err)
+	suite.Require().Len(all, 3)
+	for i, track := range all {
+		suite.Equal(trackUri(i), track.Uri)
+	}
+}
+
+func (suite *TrackListInternalSuite) TestAllTracksWithErrorReportsPartialFailure() {
+	suite.resolver.EXPECT().Page(mock.Anything, 0).
+		Return([]*connectpb.ContextTrack{{Uri: trackUri(0)}}, nil).Once()
+	suite.resolver.EXPECT().Page(mock.Anything, 1).Return(nil, context.DeadlineExceeded).Once()
+
+	all, err := suite.list.AllTracksWithError(context.Background())
+	suite.ErrorIs(err, context.DeadlineExceeded)
+	suite.Require().Len(all, 1)
+	suite.Equal(trackUri(0), all[0].Uri)
+}
+
 // expectEndlessPages models a station: every page yields more tracks and there
 // is always another page, exactly the shape that makes an unbounded seek run
 // forever.
@@ -240,6 +266,49 @@ func (suite *TrackListInternalSuite) TestSeekToQueuedTrackWithoutUid() {
 	suite.NoError(suite.list.TrySeekTo(context.Background(), &connectpb.ContextTrack{Uri: "spotify:track:queued2"}))
 
 	suite.Equal("spotify:track:queued2", suite.list.CurrentTrack().Uri)
+}
+
+// A snapshot leaves the list behind: it is read from another goroutine while
+// the list carries on being queued into and walked, so it must share nothing —
+// least of all the metadata map ContextTrackToProvidedTrack hands straight over.
+func (suite *TrackListInternalSuite) TestSnapshotSharesNothingWithTheList() {
+	suite.resolver.EXPECT().Metadata().Return(map[string]string{"context_description": "Test"}).Maybe()
+	suite.playingContext(5)
+	suite.list.AddToQueue(queued("q1", "spotify:track:queued1"))
+
+	snap := suite.list.Snapshot(context.Background(), nil)
+	suite.Require().Equal(trackUri(0), snap.Current.Uri)
+	suite.Require().Equal("spotify:track:queued1", snap.Next[0].Uri)
+	suite.Require().Equal("true", snap.Next[0].Metadata["is_queued"])
+
+	// What the list still hands out aliases its own tracks, so writing through
+	// it reaches anything that kept a reference.
+	live := suite.list.NextTracks(context.Background(), nil)
+	live[0].Metadata["is_queued"] = "rewritten"
+	snap.Metadata["context_description"] = "Mutated"
+
+	suite.Equal("true", snap.Next[0].Metadata["is_queued"], "the snapshot kept its own copy")
+	suite.Equal("Test", suite.list.Metadata()["context_description"])
+}
+
+// AllTracks seeds an autoplay station, and is reached by having run out of
+// context: anything not already loaded is by definition not recently played, so
+// it must never turn into a fetch.
+func (suite *TrackListInternalSuite) TestAllTracksIsResidentAndBounded() {
+	suite.expectEndlessPages()
+	suite.Require().NoError(suite.list.TrySeek(context.Background(), func(t *connectpb.ContextTrack) bool {
+		return t.Uri == trackUri(20)
+	}))
+
+	loaded := suite.list.tracks.len()
+	suite.Require().Greater(loaded, 3)
+
+	all := suite.list.AllTracks(3)
+	suite.Len(all, 3)
+	suite.Equal(trackUri(loaded-1), all[2].Uri, "the most recent tracks are the ones kept")
+
+	suite.Len(suite.list.AllTracks(0), loaded, "no bound keeps everything resident")
+	suite.Equal(loaded, suite.list.tracks.len(), "nothing was fetched")
 }
 
 func TestTrackListInternalSuite(t *testing.T) {

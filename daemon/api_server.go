@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,10 +19,15 @@ import (
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/player"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+	"github.com/devgianlu/go-librespot/spclient"
 	"github.com/rs/cors"
 )
 
 const timeout = 10 * time.Second
+
+// requestPickupTimeout bounds how long a request waits for the daemon to take
+// it. A variable so tests need not wait it out.
+var requestPickupTimeout = timeout
 
 type ApiServer interface {
 	Emit(ev *ApiEvent)
@@ -47,8 +53,53 @@ type ConcreteApiServer struct {
 	// authCode is the pending device authorization pairing code.
 	authCode atomic.Pointer[ApiDeviceAuth]
 
-	clients     []*websocket.Conn
+	clients     []*wsClient
 	clientsLock sync.RWMutex
+}
+
+// wsEventQueueSize is how many events a websocket client may fall behind by
+// before the oldest ones start being dropped.
+const wsEventQueueSize = 64
+
+// wsClient is one connected event listener. Events are handed to its own writer
+// goroutine rather than written inline, so that a client which has stopped
+// reading cannot hold up whoever emitted the event — that is the player loop.
+type wsClient struct {
+	conn      *websocket.Conn
+	events    chan *ApiEvent
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *wsClient) close() {
+	c.closeOnce.Do(func() { close(c.done) })
+}
+
+// send queues an event, making room by discarding the oldest when the client is
+// too far behind: a listener that falls behind is better off converging on the
+// current state than replaying a stale backlog.
+func (c *wsClient) send(log librespot.Logger, ev *ApiEvent) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+
+	for range 2 {
+		select {
+		case c.events <- ev:
+			return true
+		default:
+		}
+
+		select {
+		case <-c.events:
+			log.Warnf("websocket client is not keeping up, dropping an event")
+		default:
+		}
+	}
+
+	return false
 }
 
 var (
@@ -82,7 +133,27 @@ const (
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
+	ApiRequestTypeContextTracks       ApiRequestType = "context_tracks"
+	ApiRequestTypeLibraryPlaylists    ApiRequestType = "library_playlists"
+	ApiRequestTypeSetLiked            ApiRequestType = "set_liked"
+	ApiRequestTypeGetLiked            ApiRequestType = "get_liked"
+	ApiRequestTypePlaylistAddTracks   ApiRequestType = "playlist_add_tracks"
+	ApiRequestTypePlaylistRemoveTrack ApiRequestType = "playlist_remove_track"
+	ApiRequestTypePlaylistContains    ApiRequestType = "playlist_contains"
 )
+
+// ApiRequestDataContextTracks carries the uri query parameter of the context
+// listing request; the spec generates payloads only for request bodies.
+type ApiRequestDataContextTracks struct {
+	Uri string
+}
+
+// ApiRequestDataLibraryPlaylists carries the paging query parameters of the
+// library playlists request.
+type ApiRequestDataLibraryPlaylists struct {
+	Offset int
+	Limit  int
+}
 
 type ApiEventType string
 
@@ -101,6 +172,7 @@ const (
 	ApiEventTypeRepeatContext  ApiEventType = "repeat_context"
 	ApiEventTypeShuffleContext ApiEventType = "shuffle_context"
 	ApiEventTypePlaybackReady  ApiEventType = "playback_ready"
+	ApiEventTypePlaybackError  ApiEventType = "playback_error"
 )
 
 type ApiRequest struct {
@@ -222,11 +294,18 @@ func (p *AppPlayer) newApiResponseStatusMedia(media *librespot.Media, position i
 			albumCoverId = getBestImageIdForSize(track.Album.CoverGroup.Image, p.app.cfg.ImageSize)
 		}
 
+		artistUris := make([]string, 0, len(track.Artist))
+		for _, a := range track.Artist {
+			artistUris = append(artistUris, gidUri(librespot.SpotifyIdTypeArtist, a.GetGid()))
+		}
+
 		return &ApiTrack{
 			Uri:           librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, track.Gid).Uri(),
 			Name:          *track.Name,
 			ArtistNames:   artists,
+			ArtistUris:    artistUris,
 			AlbumName:     *track.Album.Name,
+			AlbumUri:      gidUri(librespot.SpotifyIdTypeAlbum, track.Album.GetGid()),
 			AlbumCoverUrl: p.prodInfo.ImageUrl(albumCoverId),
 			Position:      position,
 			Duration:      int(*track.Duration),
@@ -243,7 +322,9 @@ func (p *AppPlayer) newApiResponseStatusMedia(media *librespot.Media, position i
 			Uri:           librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeEpisode, episode.Gid).Uri(),
 			Name:          *episode.Name,
 			ArtistNames:   []string{*episode.Show.Name},
+			ArtistUris:    []string{},
 			AlbumName:     *episode.Show.Name,
+			AlbumUri:      gidUri(librespot.SpotifyIdTypeShow, episode.Show.GetGid()),
 			AlbumCoverUrl: p.prodInfo.ImageUrl(albumCoverId),
 			Position:      position,
 			Duration:      int(*episode.Duration),
@@ -252,6 +333,15 @@ func (p *AppPlayer) newApiResponseStatusMedia(media *librespot.Media, position i
 			DiscNumber:    0,
 		}
 	}
+}
+
+// gidUri turns a metadata gid into a URI of the given type, or "" when the
+// gid is missing or malformed.
+func gidUri(typ librespot.SpotifyIdType, gid []byte) string {
+	if len(gid) != 16 {
+		return ""
+	}
+	return librespot.SpotifyIdFromGid(typ, gid).Uri()
 }
 
 type ApiEvent struct {
@@ -290,6 +380,16 @@ type ApiEventDataPaused struct {
 
 type ApiEventDataStopped struct {
 	PlayOrigin string `json:"play_origin"`
+}
+
+type ApiEventDataPlaybackError struct {
+	ContextUri string `json:"context_uri"`
+	Uri        string `json:"uri"`
+	PlayOrigin string `json:"play_origin"`
+	Stage      string `json:"stage"`
+	Kind       string `json:"kind"`
+	Unplayable bool   `json:"unplayable"`
+	Message    string `json:"message"`
 }
 
 type ApiEventDataSeek struct {
@@ -351,7 +451,21 @@ func (s *StubApiServer) Close() error {
 
 func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
 	req.resp = make(chan apiResponse, 1)
-	s.requests <- req
+
+	// Only the hand-off is bounded: once taken, a request is answered, if
+	// perhaps later (see errReplyDeferred). One nobody takes is owed nothing,
+	// and waiting on it would park this handler for good.
+	pickup := time.NewTimer(requestPickupTimeout)
+	defer pickup.Stop()
+
+	select {
+	case s.requests <- req:
+	case <-pickup.C:
+		s.log.Warnf("nothing picked up request %s", req.Type)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
 	resp := <-req.resp
 
 	if resp.err != nil {
@@ -370,6 +484,9 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
 			return
 		case errors.Is(resp.err, ErrTooManyRequests):
 			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy), errors.Is(resp.err, spclient.ErrPlaylistConflict):
+			w.WriteHeader(http.StatusConflict)
 			return
 		case errors.Is(resp.err, ErrBadRequest):
 			w.WriteHeader(http.StatusBadRequest)
@@ -432,6 +549,124 @@ func (s *ConcreteApiServer) GetAuthCode(w http.ResponseWriter, _ *http.Request) 
 
 func (s *ConcreteApiServer) GetToken(w http.ResponseWriter, _ *http.Request) {
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
+}
+
+func (s *ConcreteApiServer) GetContextTracks(w http.ResponseWriter, _ *http.Request, params GetContextTracksParams) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeContextTracks, Data: ApiRequestDataContextTracks{Uri: params.Uri}}, w)
+}
+
+// Paging bounds of /library/playlists, matching the spec.
+const (
+	libraryPlaylistsDefaultLimit = 50
+	libraryPlaylistsMaxLimit     = 500
+)
+
+func (s *ConcreteApiServer) GetLibraryPlaylists(w http.ResponseWriter, r *http.Request, params GetLibraryPlaylistsParams) {
+	// The generated params cannot tell an absent limit from limit=0.
+	if !r.URL.Query().Has("limit") {
+		params.Limit = libraryPlaylistsDefaultLimit
+	}
+
+	if params.Offset < 0 || params.Limit < 1 || params.Limit > libraryPlaylistsMaxLimit {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeLibraryPlaylists, Data: ApiRequestDataLibraryPlaylists{Offset: params.Offset, Limit: params.Limit}}, w)
+}
+
+// maxLibraryUris caps how many items one library request may name.
+const maxLibraryUris = 50
+
+// validItemUris reports whether uris holds 1 to maxLibraryUris URIs, all
+// of one of the given types.
+func validItemUris(uris []string, types ...librespot.SpotifyIdType) bool {
+	if len(uris) == 0 || len(uris) > maxLibraryUris {
+		return false
+	}
+
+	for _, uri := range uris {
+		id, err := librespot.SpotifyIdFromUri(uri)
+		if err != nil || !slices.Contains(types, id.Type()) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (s *ConcreteApiServer) GetLiked(w http.ResponseWriter, _ *http.Request, params GetLikedParams) {
+	if !validItemUris(params.Uris, librespot.SpotifyIdTypeTrack) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeGetLiked, Data: params.Uris}, w)
+}
+
+func (s *ConcreteApiServer) SetLiked(w http.ResponseWriter, r *http.Request) {
+	// liked is required: decoded into a plain bool, a missing or null value
+	// would read as false and remove the tracks from Liked Songs.
+	var data struct {
+		Uris  []string `json:"uris"`
+		Liked *bool    `json:"liked"`
+	}
+	if err := jsonDecode(r, &data); err != nil || data.Liked == nil || !validItemUris(data.Uris, librespot.SpotifyIdTypeTrack) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetLiked, Data: ApiSetLiked{Uris: data.Uris, Liked: *data.Liked}}, w)
+}
+
+func (s *ConcreteApiServer) PlaylistAddTracks(w http.ResponseWriter, r *http.Request) {
+	var data ApiPlaylistAddTracks
+	if err := jsonDecode(r, &data); err != nil || !validItemUris(data.Uris, librespot.SpotifyIdTypeTrack, librespot.SpotifyIdTypeEpisode) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if !validPlaylistUri(data.PlaylistUri) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlaylistAddTracks, Data: data}, w)
+}
+
+// validPlaylistUri reports whether uri names a playlist.
+func validPlaylistUri(uri string) bool {
+	id, err := librespot.SpotifyIdFromUri(uri)
+	return err == nil && id.Type() == librespot.SpotifyIdTypePlaylist
+}
+
+func (s *ConcreteApiServer) PlaylistRemoveTrack(w http.ResponseWriter, r *http.Request) {
+	var data ApiPlaylistRemoveTrack
+	if err := jsonDecode(r, &data); err != nil ||
+		!validPlaylistUri(data.PlaylistUri) ||
+		!validItemUris([]string{data.Uri}, librespot.SpotifyIdTypeTrack, librespot.SpotifyIdTypeEpisode) ||
+		(data.Position != nil && *data.Position < 0) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlaylistRemoveTrack, Data: data}, w)
+}
+
+// ApiRequestDataPlaylistContains carries the query of a contains request.
+type ApiRequestDataPlaylistContains struct {
+	PlaylistUri string
+	Uris        []string
+}
+
+func (s *ConcreteApiServer) PlaylistContains(w http.ResponseWriter, _ *http.Request, params PlaylistContainsParams) {
+	if !validPlaylistUri(params.PlaylistUri) ||
+		!validItemUris(params.Uris, librespot.SpotifyIdTypeTrack, librespot.SpotifyIdTypeEpisode) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlaylistContains, Data: ApiRequestDataPlaylistContains{PlaylistUri: params.PlaylistUri, Uris: params.Uris}}, w)
 }
 
 func (s *ConcreteApiServer) PlayerResume(w http.ResponseWriter, _ *http.Request) {
@@ -600,10 +835,18 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// add the client to the list
+	client := &wsClient{
+		conn:   c,
+		events: make(chan *ApiEvent, wsEventQueueSize),
+		done:   make(chan struct{}),
+	}
+
 	s.clientsLock.Lock()
-	s.clients = append(s.clients, c)
+	s.clients = append(s.clients, client)
 	s.clientsLock.Unlock()
+
+	go s.writeEvents(client)
+	defer client.close()
 
 	s.log.Debugf("new websocket client")
 
@@ -617,7 +860,7 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
 			// remove the client from the list
 			s.clientsLock.Lock()
 			for i, cc := range s.clients {
-				if cc == c {
+				if cc == client {
 					s.clients = append(s.clients[:i], s.clients[i+1:]...)
 					break
 				}
@@ -661,12 +904,26 @@ func (s *ConcreteApiServer) Emit(ev *ApiEvent) {
 	s.log.Tracef("emitting websocket event: %s", ev.Type)
 
 	for _, client := range s.clients {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err := wsjson.Write(ctx, client, ev)
-		cancel()
-		if err != nil {
-			// purposely do not propagate this to the caller
-			s.log.WithError(err).Error("failed communicating with websocket client")
+		client.send(s.log, ev)
+	}
+}
+
+// writeEvents delivers one client's events in order. One goroutine per client
+// rather than one per event, because listeners rely on the order they arrive in:
+// will_play before metadata, paused before playing.
+func (s *ConcreteApiServer) writeEvents(client *wsClient) {
+	for {
+		select {
+		case <-client.done:
+			return
+		case ev := <-client.events:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := wsjson.Write(ctx, client.conn, ev)
+			cancel()
+			if err != nil && !s.close.Load() {
+				// purposely do not propagate this to the caller
+				s.log.WithError(err).Error("failed communicating with websocket client")
+			}
 		}
 	}
 }
@@ -685,7 +942,8 @@ func (s *ConcreteApiServer) Close() error {
 	// close all websocket clients
 	s.clientsLock.RLock()
 	for _, client := range s.clients {
-		_ = client.Close(websocket.StatusGoingAway, "")
+		client.close()
+		_ = client.conn.Close(websocket.StatusGoingAway, "")
 	}
 	s.clientsLock.RUnlock()
 

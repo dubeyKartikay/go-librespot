@@ -61,6 +61,7 @@ type RequestPayload struct {
 		RepeatingTrack   *bool                     `json:"repeating_track"`
 		RepeatingContext *bool                     `json:"repeating_context"`
 		ShufflingContext *bool                     `json:"shuffling_context"`
+		Modes            map[string]string         `json:"modes"`
 		LoggingParams    struct {
 			CommandInitiatedTime int64    `json:"command_initiated_time"`
 			PageInstanceIds      []string `json:"page_instance_ids"`
@@ -71,6 +72,7 @@ type RequestPayload struct {
 			RestorePaused       string `json:"restore_paused"`
 			RestorePosition     string `json:"restore_position"`
 			RestoreTrack        string `json:"restore_track"`
+			RetainSession       string `json:"retain_session"`
 			AlwaysPlaySomething bool   `json:"always_play_something"`
 			AllowSeeking        bool   `json:"allow_seeking"`
 			SkipTo              struct {
@@ -189,7 +191,11 @@ func (d *Dealer) handleMessage(rawMsg *RawMessage) {
 	}
 
 	for _, recv := range matchedReceivers {
-		recv.c <- msg
+		select {
+		case recv.c <- msg:
+		case <-d.done:
+			return
+		}
 	}
 }
 

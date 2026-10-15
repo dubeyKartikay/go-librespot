@@ -4,7 +4,28 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	librespot "github.com/devgianlu/go-librespot"
+	"github.com/devgianlu/go-librespot/spclient"
 )
+
+// sessionBrowser captures the immutable inputs needed by the fork's legacy
+// browse/resolver APIs. Network requests run off the player loop, like the
+// upstream library APIs, without reading mutable AppPlayer state.
+type sessionBrowser struct {
+	sp        *spclient.Spclient
+	username  string
+	log       librespot.Logger
+	prodInfo  *ProductInfo
+	imageSize string
+}
+
+func (p *AppPlayer) sessionBrowser() sessionBrowser {
+	return sessionBrowser{
+		sp: p.sess.Spclient(), username: p.sess.Username(), log: p.app.log,
+		prodInfo: p.prodInfo, imageSize: p.app.cfg.ImageSize,
+	}
+}
 
 const ApiRequestTypeResolveTracks ApiRequestType = "resolve_tracks"
 
